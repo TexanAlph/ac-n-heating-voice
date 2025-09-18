@@ -3,9 +3,9 @@ import bodyParser from "body-parser";
 import fetch from "node-fetch";
 import { nanoid } from "nanoid";
 
-// Twilio is CommonJS → import default then destructure
+// Twilio (CommonJS → import default then destructure)
 import twilioPkg from "twilio";
-const { twiml: Twiml, Twilio } = twilioPkg;
+const { twiml: Twiml } = twilioPkg;
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -61,11 +61,11 @@ async function askOpenAI(transcript, userLine) {
   return data.choices?.[0]?.message?.content?.trim() || "Could you repeat that, please?";
 }
 
-// ===== Helper: TTS proxy to ElevenLabs =====
+// ===== Improved TTS proxy to ElevenLabs =====
 app.get("/tts", async (req, res) => {
   try {
     const text = (req.query.text || "Hello.").toString().slice(0, 500);
-    const voiceId = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
+    const voiceId = process.env.ELEVENLABS_VOICE_ID;
 
     const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`, {
       method: "POST",
@@ -80,11 +80,17 @@ app.get("/tts", async (req, res) => {
       })
     });
 
-    if (!r.ok) return res.status(500).send("TTS error");
+    if (!r.ok) {
+      const errText = await r.text();
+      console.error("ElevenLabs API Error:", r.status, errText);
+      return res.status(500).send(`TTS error: ${r.status} ${errText}`);
+    }
 
     res.setHeader("Content-Type", "audio/mpeg");
     r.body.pipe(res);
+
   } catch (e) {
+    console.error("TTS exception:", e);
     res.status(500).send("TTS failure");
   }
 });
@@ -128,16 +134,12 @@ app.post("/gather", async (req, res) => {
   }
 
   const twiml = new Twiml.VoiceResponse();
-
-  // Ask AI what to say next
   const reply = await askOpenAI([], userSaid);
 
-  // Play reply
-  const sayUrl = new URL(req.protocol + "://" + req.get("host") + "/tts");
+  const sayUrl = new URL("https://" + req.get("host") + "/tts");
   sayUrl.searchParams.set("text", reply);
-  twiml.play(sayUrl.toString());
 
-  // Continue gathering
+  twiml.play(sayUrl.toString());
   const g = twiml.gather({
     input: "speech",
     action: "/gather",
