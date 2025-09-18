@@ -101,7 +101,7 @@ app.post("/voice", (req, res) => {
   const twiml = new Twiml.VoiceResponse();
   const opener = `Hi, this is Rachel with ${process.env.COMPANY_NAME || "AC-N-Heating"}. What problem can we help you with today?`;
 
-  const sayUrl = new URL(req.protocol + "://" + req.get("host") + "/tts");
+  const sayUrl = new URL("https://" + req.get("host") + "/tts");
   sayUrl.searchParams.set("text", opener);
 
   twiml.play(sayUrl.toString());
