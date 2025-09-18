@@ -1,7 +1,8 @@
 import express from "express";
 import bodyParser from "body-parser";
 import fetch from "node-fetch";
-import { twiml as Twiml, Twilio } from "twilio";
+import twilioPkg from "twilio";
+const { twiml: Twiml, Twilio } = twilioPkg;
 import { nanoid } from "nanoid";
 
 /**
