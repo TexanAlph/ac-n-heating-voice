@@ -179,7 +179,7 @@ app.post("/voice", (req, res) => {
   SESSIONS.set(callSid, session);
 
   // Play opener from ElevenLabs, then gather speech
-  const opener = `Hi, this is John with ${process.env.COMPANY_NAME || "AC-N-Heating"}. What problem can we help you with today?`;
+  const opener = `Hi, this is Rachel with ${process.env.COMPANY_NAME || "AC-N-Heating"}. What problem can we help you with today?`;
 
   const sayUrl = new URL(req.protocol + "://" + req.get("host") + "/tts");
   sayUrl.searchParams.set("text", opener);
