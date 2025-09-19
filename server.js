@@ -1,6 +1,7 @@
 import express from "express";
 import bodyParser from "body-parser";
 import WebSocket, { WebSocketServer } from "ws";
+import { toByteArray, fromByteArray } from "base64-js";
 import twilio from "twilio";
 
 const { twiml: Twiml } = twilio;
@@ -22,9 +23,9 @@ const twilioClient =
 
 const now = () => new Date().toISOString();
 
-// -------- Base64 helpers (no external deps) --------
-const b64ToBytes = (b64) => new Uint8Array(Buffer.from(b64, "base64"));
-const bytesToB64 = (u8) => Buffer.from(u8).toString("base64");
+// -------- Base64 helpers --------
+const b64ToBytes = (b64) => toByteArray(b64);
+const bytesToB64 = (u8) => fromByteArray(u8 instanceof Uint8Array ? u8 : new Uint8Array(u8));
 
 // -------- G.711 μ-law <-> PCM16 and resampling --------
 function muLawDecode(uVal) {
@@ -90,8 +91,19 @@ function pcm16ToUlawB64FromPCM16Int16(int16, inRate = 16000) {
 // -------- TwiML: start a Media Stream to /media --------
 app.post("/twiml", (req, res) => {
   const vr = new Twiml.VoiceResponse();
-  // Small prompt so line isn't dead silent
-  vr.say({ voice: "alice", language: "en-US" }, "Connecting you now.");
+  vr.say(
+    { voice: "alice", language: "en-US" },
+    "Hi, this is Rachel with AC and Heating. How can I help you today?"
+  );
+
+  if (!OPENAI_API_KEY) {
+    vr.pause({ length: 1 });
+    vr.say({ voice: "alice", language: "en-US" }, "Sorry, something went wrong. Please call again.");
+    vr.hangup();
+    res.type("text/xml").send(vr.toString());
+    return;
+  }
+
   const connect = vr.connect();
   const stream = connect.stream({ url: `wss://${req.headers.host}/media` });
   // pass metadata (optional)
@@ -120,18 +132,42 @@ class Bridge {
     this.summaryTexts = [];
     this.openaiWs = null;
     this.openaiOutputSampleRate = 16000;
+    this.openaiReady = false;
+    this.fallbackTriggered = false;
+    this.loggedReceivedAudio = false;
+    this.loggedSentAudio = false;
+    this.closedByStop = false;
+    this.warnedOpenAiNotReady = false;
+
+    console.log(
+      `${now()} Connected to Twilio stream ${this.streamSid} (callSid: ${this.callSid || "unknown"})`
+    );
+
+    if (!OPENAI_API_KEY) {
+      this._sendFallbackAndClose("Missing OPENAI_API_KEY");
+      return;
+    }
+
     this._initOpenAI();
   }
 
   _initOpenAI() {
-    const headers = {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "OpenAI-Beta": "realtime=v1",
-    };
-    this.openaiWs = new WebSocket(OPENAI_WS_URL, { headers });
+    try {
+      const headers = {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
+      };
+      this.openaiWs = new WebSocket(OPENAI_WS_URL, { headers });
+    } catch (err) {
+      this._sendFallbackAndClose(`Failed to init OpenAI WebSocket: ${err?.message || err}`);
+      return;
+    }
 
     this.openaiWs.on("open", () => {
-      // Configure session
+      this.openaiReady = true;
+      this.warnedOpenAiNotReady = false;
+      console.log(`${now()} Connected to OpenAI Realtime for stream ${this.streamSid}`);
+
       const sessionUpdate = {
         type: "session.update",
         session: {
@@ -146,9 +182,16 @@ class Bridge {
             "5) If caller asks prices/financing/warranty/brands, say you'll note it for the technician.",
             "6) Confirm captured info once near the end; if any detail is wrong, re-ask only that piece.",
             "7) Close naturally: 'Perfect, I’ll pass this along and dispatch will follow up shortly.'",
+            "If silence continues, wait calmly; do not keep repeating 'could you repeat that?'.",
             "Keep responses concise; avoid sounding robotic."
           ].join(" "),
-          turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 250, silence_duration_ms: 500, create_response: true },
+          turn_detection: {
+            type: "server_vad",
+            threshold: 0.5,
+            prefix_padding_ms: 250,
+            silence_duration_ms: 500,
+            create_response: true
+          },
           input_audio_transcription: { model: "whisper-1" },
           input_audio_format: "pcm16",
           output_audio_format: "pcm16"
@@ -156,7 +199,6 @@ class Bridge {
       };
       this.openaiWs.send(JSON.stringify(sessionUpdate));
 
-      // Start with a spoken greeting so the caller hears Rachel immediately
       this.openaiWs.send(JSON.stringify({
         type: "response.create",
         response: {
@@ -166,15 +208,22 @@ class Bridge {
       }));
     });
 
-    // Keepalive
-    this.openaiWs.on("ping", () => this.openaiWs.pong());
+    this.openaiWs.on("ping", () => {
+      if (this.openaiWs?.readyState === WebSocket.OPEN) {
+        this.openaiWs.pong();
+      }
+    });
 
-    // Handle Realtime messages
     this.openaiWs.on("message", (buf) => {
+      if (this.fallbackTriggered) return;
       let msg;
-      try { msg = JSON.parse(buf.toString()); } catch { return; }
+      try {
+        msg = JSON.parse(buf.toString());
+      } catch (err) {
+        console.error(`${now()} Failed to parse OpenAI message:`, err);
+        return;
+      }
 
-      // Collect transcripts for SMS summary
       if (msg.type === "conversation.item.input_audio_transcription.completed" && msg.transcript) {
         this.summaryTexts.push(`[Caller] ${msg.transcript}`);
         return;
@@ -184,7 +233,6 @@ class Bridge {
         return;
       }
 
-      // Stream audio deltas → Twilio
       if (msg.type === "response.audio.delta" && msg.delta) {
         const int16 = pcm16B64ToInt16(msg.delta);
         const ulawB64 = pcm16ToUlawB64FromPCM16Int16(int16, this.openaiOutputSampleRate);
@@ -192,31 +240,41 @@ class Bridge {
         return;
       }
 
-      // End of an utterance: mark (helps Twilio playback align)
       if (msg.type === "response.audio.done" || msg.type === "response.done") {
         this._twilioMark();
         return;
       }
 
-      // Session format info
       if (msg.type === "session.created" && msg.session?.output_audio_format?.sample_rate_hz) {
         this.openaiOutputSampleRate = msg.session.output_audio_format.sample_rate_hz;
-        return;
       }
     });
 
     this.openaiWs.on("error", (e) => {
-      console.error(`${now()} OpenAI WS error:`, e?.message || e);
+      const msg = e?.message || e;
+      console.error(`${now()} OpenAI WS error for stream ${this.streamSid}:`, msg);
+      this._sendFallbackAndClose(`OpenAI error: ${msg}`);
     });
 
-    this.openaiWs.on("close", () => {
-      // no-op
+    this.openaiWs.on("close", (code, reason) => {
+      this.openaiReady = false;
+      console.log(
+        `${now()} OpenAI WS closed for stream ${this.streamSid} (code: ${code || ""}${reason ? ` reason: ${reason}` : ""})`
+      );
+      if (!this.fallbackTriggered && !this.closedByStop) {
+        this._sendFallbackAndClose("OpenAI connection closed unexpectedly");
+      }
     });
   }
 
   // Send audio to Twilio
   _twilioMedia(base64Ulaw) {
+    if (this.fallbackTriggered) return;
     if (this.twilioWs?.readyState === WebSocket.OPEN) {
+      if (!this.loggedSentAudio) {
+        console.log(`${now()} Sent audio back to Twilio for stream ${this.streamSid}`);
+        this.loggedSentAudio = true;
+      }
       this.twilioWs.send(JSON.stringify({
         event: "media",
         streamSid: this.streamSid,
@@ -234,6 +292,47 @@ class Bridge {
     }
   }
 
+  _sendFallbackAndClose(reason) {
+    if (this.fallbackTriggered) return;
+    this.fallbackTriggered = true;
+    this.closedByStop = true;
+    this.openaiReady = false;
+    console.error(`${now()} Triggering fallback for stream ${this.streamSid}: ${reason}`);
+
+    if (this.openaiWs && this.openaiWs.readyState === WebSocket.OPEN) {
+      try {
+        this.openaiWs.close(1011, "fallback");
+      } catch (err) {
+        console.error(`${now()} Failed to close OpenAI socket cleanly:`, err?.message || err);
+      }
+    }
+
+    const fallbackTwiml = "<Response><Say>Sorry, something went wrong. Please call again.</Say></Response>";
+    if (twilioClient && this.callSid) {
+      twilioClient
+        .calls(this.callSid)
+        .update({ twiml: fallbackTwiml })
+        .then(() => {
+          console.log(`${now()} Fallback TwiML sent to call ${this.callSid}`);
+        })
+        .catch((err) => {
+          console.error(`${now()} Failed to send fallback TwiML:`, err?.message || err);
+        });
+    } else {
+      console.warn(
+        `${now()} Cannot send fallback TwiML (missing Twilio credentials or callSid) for stream ${this.streamSid}`
+      );
+    }
+
+    if (this.twilioWs?.readyState === WebSocket.OPEN) {
+      try {
+        this.twilioWs.close(1011, "fallback");
+      } catch (err) {
+        console.error(`${now()} Failed to close Twilio socket cleanly:`, err?.message || err);
+      }
+    }
+  }
+
   // Twilio -> OpenAI
   handleTwilioMessage(obj) {
     switch (obj.event) {
@@ -241,7 +340,18 @@ class Bridge {
         // created by constructor
         break;
       case "media": {
-        if (!this.openaiWs || this.openaiWs.readyState !== WebSocket.OPEN) return;
+        if (this.fallbackTriggered) return;
+        if (!this.openaiReady || !this.openaiWs || this.openaiWs.readyState !== WebSocket.OPEN) {
+          if (!this.warnedOpenAiNotReady) {
+            console.warn(`${now()} OpenAI socket not ready for stream ${this.streamSid}, dropping audio frame.`);
+            this.warnedOpenAiNotReady = true;
+          }
+          return;
+        }
+        if (!this.loggedReceivedAudio) {
+          console.log(`${now()} Received audio from Twilio for stream ${this.streamSid}`);
+          this.loggedReceivedAudio = true;
+        }
         const pcm16b64 = ulawB64ToPcm16B64_16k(obj.media.payload);
         this.openaiWs.send(JSON.stringify({
           type: "input_audio_buffer.append",
@@ -251,6 +361,15 @@ class Bridge {
         break;
       }
       case "stop":
+        this.closedByStop = true;
+        console.log(`${now()} Twilio stream ${this.streamSid} sent stop.`);
+        if (this.openaiWs && this.openaiWs.readyState === WebSocket.OPEN) {
+          try {
+            this.openaiWs.close(1000, "twilio stop");
+          } catch (err) {
+            console.error(`${now()} Error closing OpenAI socket on stop:`, err?.message || err);
+          }
+        }
         this.finishAndTextSummary();
         break;
       case "connected":
@@ -276,7 +395,7 @@ class Bridge {
 
 // Upgrade HTTP → WS for /media
 const server = app.listen(PORT, () => {
-  console.log(`AI receptionist running on ${PORT}`);
+  console.log(`${now()} AI receptionist running on ${PORT}`);
 });
 server.on("upgrade", (req, socket, head) => {
   if (req.url === "/media") {
@@ -286,7 +405,7 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 wss.on("connection", (ws) => {
-  console.log("New Twilio media stream connected");
+  console.log(`${now()} New Twilio media stream connected`);
   let bridge = null;
   ws.on("message", (msg) => {
     let obj;
