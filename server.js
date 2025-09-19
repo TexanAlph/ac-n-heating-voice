@@ -1,162 +1,123 @@
 // server.js
 import express from "express";
 import bodyParser from "body-parser";
-import fetch from "node-fetch";
 import pkg from "twilio";
 
 const { twiml: Twiml, Twilio } = pkg;
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 
-// Load env variables
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
-const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "EXAVITQu4vr4xnSDxMaL"; // replace with your chosen ElevenLabs v3 voice ID
+// Twilio setup
 const TWILIO_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH = process.env.TWILIO_AUTH_TOKEN;
-const TO_SMS = "+12104781836"; // Your number
-const FROM_SMS = process.env.TWILIO_NUMBER; // Your Twilio number
-
+const FROM_SMS = process.env.TWILIO_NUMBER;
+const TO_SMS = "+12104781836"; // Your cell
 const twilioClient = new Twilio(TWILIO_SID, TWILIO_AUTH);
 
-// Conversation state tracker
+// Session tracker
 const sessions = {};
 
-// System prompt (Rachel’s script)
-const SYSTEM_PROMPT = `
-You are Rachel, a friendly AI receptionist for AC & Heating.
-Your job is to intake caller details naturally. Stay conversational, not robotic.
-Follow this flow:
+// State flow order
+const STATES = ["problem", "name", "phone", "address", "zip", "confirm", "close"];
 
-1. Greeting:
-"Hi, this is Rachel with AC and Heating, how can I help you today?"
+// Helper: get next state
+function getNextState(current) {
+  const idx = STATES.indexOf(current);
+  return idx >= 0 && idx < STATES.length - 1 ? STATES[idx + 1] : "close";
+}
 
-2. Problem Intake:
-- Listen, then acknowledge with a random variation:
-  - "Mhm, okay, I got you."
-  - "Alright, I hear you."
-  - "Got it, thanks for letting me know."
-  - "Yeah, that makes sense."
-- Classify into repair, maintenance, install, or other.
-- For random questions say:
-  - "I’m not sure about that, but I’ll make sure the tech finds out for you."
-  - "Good question — I’ll jot that down and have the office confirm when they call you back."
+// Helper: get question for each state
+function getQuestion(state, data = {}) {
+  switch (state) {
+    case "problem":
+      return "Hi, this is Rachel with AC and Heating. How can I help you today?";
+    case "name":
+      return "Mhm, okay, I got you. Can I have your name please?";
+    case "phone":
+      return "Thanks. What’s the best number to reach you?";
+    case "address":
+      return "And what’s the service address?";
+    case "zip":
+      return "And the ZIP code there?";
+    case "confirm":
+      return `So I have ${data.name || "?"}, ${data.phone || "?"}, ${data.address || "?"}, ZIP ${data.zip || "?"}. Is that correct?`;
+    case "close":
+      return "Perfect, I’ve got everything noted. Dispatch will call you shortly. Goodbye.";
+    default:
+      return "Okay, thank you. Goodbye.";
+  }
+}
 
-3. Intake order:
-- Name → Phone → Address → ZIP
-- Confirm all details back
-- Close with one variation:
-  - "Perfect, I’ve got everything noted. Dispatch will call you shortly."
-  - "Okay, thanks [NAME], I’ve passed this along and someone will follow up soon."
-  - "Alright, I’ll make sure the office has this info. We’ll be in touch shortly."
+// Twilio: entry point
+app.post("/voice", (req, res) => {
+  const callSid = req.body.CallSid;
+  sessions[callSid] = { state: "problem", data: {} };
 
-Rules:
-- Never loop endlessly. Retry max 2 times, then move on.
-- Do not give pricing or financing info.
-- Be empathetic if caller upset.
-- Use fillers like "mhm" or "okay" to sound human.
-`;
-
-// Endpoint: Voice webhook
-app.post("/voice", async (req, res) => {
   const twiml = new Twiml.VoiceResponse();
-
-  // Start conversation
   const gather = twiml.gather({
     input: "speech",
     action: "/gather",
     method: "POST",
     speechTimeout: "auto"
   });
+  gather.say(getQuestion("problem"), { voice: "alice" });
 
-  gather.say("Hi, this is Rachel with AC and Heating, how can I help you today?", { voice: "alice" });
   res.type("text/xml");
   res.send(twiml.toString());
 });
 
-// Handle gathered speech
-app.post("/gather", async (req, res) => {
-  const userSpeech = req.body.SpeechResult || "";
+// Handle responses
+app.post("/gather", (req, res) => {
   const callSid = req.body.CallSid;
+  const speech = req.body.SpeechResult || "";
+  const session = sessions[callSid];
 
-  if (!sessions[callSid]) {
-    sessions[callSid] = { history: [] };
+  if (!session) {
+    const twiml = new Twiml.VoiceResponse();
+    twiml.say("Sorry, something went wrong. Goodbye.");
+    return res.type("text/xml").send(twiml.toString());
   }
 
-  sessions[callSid].history.push({ role: "user", content: userSpeech });
+  // Save response by state
+  if (session.state !== "confirm" && session.state !== "close") {
+    session.data[session.state] = speech;
+  }
 
-  // Send to OpenAI
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        ...sessions[callSid].history
-      ]
-    })
-  });
+  // Move state forward
+  session.state = getNextState(session.state);
 
-  const data = await response.json();
-  const aiReply = data.choices?.[0]?.message?.content || "Okay.";
-
-  sessions[callSid].history.push({ role: "assistant", content: aiReply });
-
-  // Convert AI reply to voice with ElevenLabs
-  const audioResp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream`, {
-    method: "POST",
-    headers: {
-      "xi-api-key": ELEVEN_API_KEY,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      text: aiReply,
-      voice_settings: { stability: 0.4, similarity_boost: 0.9 },
-      model_id: "eleven_multilingual_v3"
-    })
-  });
-
+  // Build next question
   const twiml = new Twiml.VoiceResponse();
-  if (audioResp.ok) {
-    // Save mp3 temporarily in streaming scenario; for demo, use <Say>
-    twiml.say(aiReply, { voice: "alice" });
+  if (session.state === "close") {
+    twiml.say(getQuestion("close"), { voice: "alice" });
+
+    // Send SMS summary
+    const summary = `
+New HVAC Call:
+Problem: ${session.data.problem || "?"}
+Name: ${session.data.name || "?"}
+Phone: ${session.data.phone || "?"}
+Address: ${session.data.address || "?"}
+ZIP: ${session.data.zip || "?"}
+    `;
+    twilioClient.messages.create({
+      body: summary,
+      from: FROM_SMS,
+      to: TO_SMS
+    }).catch(err => console.error("SMS failed:", err));
+
+  } else {
     const gather = twiml.gather({
       input: "speech",
       action: "/gather",
       method: "POST",
       speechTimeout: "auto"
     });
-    gather.say(" ", { voice: "alice" });
-  } else {
-    twiml.say("Sorry, something went wrong. I’ll make sure the office gets your message.", { voice: "alice" });
+    gather.say(getQuestion(session.state, session.data), { voice: "alice" });
   }
 
   res.type("text/xml");
   res.send(twiml.toString());
-});
-
-// End of call: send summary SMS
-app.post("/end", async (req, res) => {
-  const callSid = req.body.CallSid;
-  const history = sessions[callSid]?.history || [];
-
-  const summary = history.map(h => `${h.role}: ${h.content}`).join("\n");
-
-  try {
-    await twilioClient.messages.create({
-      body: `New HVAC Call Intake:\n${summary}`,
-      from: FROM_SMS,
-      to: TO_SMS
-    });
-  } catch (err) {
-    console.error("SMS failed:", err);
-  }
-
-  res.sendStatus(200);
 });
 
 // Start server
