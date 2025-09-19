@@ -1,11 +1,14 @@
 // server.js
 import express from "express";
 import bodyParser from "body-parser";
-import { WebSocketServer } from "ws";
-import WebSocket from "ws";
-import { twiml as Twiml } from "twilio";
+import WebSocket, { WebSocketServer } from "ws";
 import twilio from "twilio";
-import * as b64 from "base64-js";
+
+const { twiml: Twiml } = twilio;
+
+// Base64 helpers (use Node's Buffer instead of base64-js)
+const b64ToBytes = (b64) => new Uint8Array(Buffer.from(b64, "base64"));
+const bytesToB64 = (u8) => Buffer.from(u8).toString("base64");
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
