@@ -1,7 +1,6 @@
 import express from "express";
 import bodyParser from "body-parser";
 import WebSocket, { WebSocketServer } from "ws";
-import { toByteArray, fromByteArray } from "base64-js";
 import twilio from "twilio";
 
 const { twiml: Twiml } = twilio;
@@ -23,9 +22,9 @@ const twilioClient =
 
 const now = () => new Date().toISOString();
 
-// -------- Base64 helpers --------
-const b64ToBytes = (b64) => toByteArray(b64);
-const bytesToB64 = (u8) => fromByteArray(u8 instanceof Uint8Array ? u8 : new Uint8Array(u8));
+// -------- Base64 helpers (Node Buffer) --------
+const b64ToBuffer = (b64) => Buffer.from(b64, "base64");
+const bufferToB64 = (buf) => Buffer.from(buf).toString("base64");
 
 // -------- G.711 μ-law <-> PCM16 and resampling --------
 function muLawDecode(uVal) {
@@ -66,18 +65,16 @@ function resamplePCM16(int16Array, inRate, outRate) {
   }
   return out;
 }
-function ulawB64ToPcm16B64_16k(b64In) {
-  const bytes = b64ToBytes(b64In);
-  const pcm8k = new Int16Array(bytes.length);
-  for (let i = 0; i < bytes.length; i++) pcm8k[i] = muLawDecode(bytes[i]);
+function ulawBufferToPcm16Buffer16k(ulawBuffer) {
+  const pcm8k = new Int16Array(ulawBuffer.length);
+  for (let i = 0; i < ulawBuffer.length; i++) pcm8k[i] = muLawDecode(ulawBuffer[i]);
   const pcm16k = resamplePCM16(pcm8k, 8000, 16000);
-  const buf = Buffer.from(pcm16k.buffer, pcm16k.byteOffset, pcm16k.byteLength);
-  return buf.toString("base64");
+  return Buffer.from(pcm16k.buffer, pcm16k.byteOffset, pcm16k.byteLength);
 }
 function pcm16B64ToInt16(b64In) {
-  const bytes = b64ToBytes(b64In);
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const out = new Int16Array(bytes.byteLength / 2);
+  const buf = b64ToBuffer(b64In);
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const out = new Int16Array(buf.byteLength / 2);
   for (let i = 0; i < out.length; i++) out[i] = view.getInt16(i * 2, true);
   return out;
 }
@@ -85,7 +82,7 @@ function pcm16ToUlawB64FromPCM16Int16(int16, inRate = 16000) {
   const pcm8k = resamplePCM16(int16, inRate, 8000);
   const out = new Uint8Array(pcm8k.length);
   for (let i = 0; i < pcm8k.length; i++) out[i] = muLawEncode(pcm8k[i]);
-  return bytesToB64(out);
+  return bufferToB64(Buffer.from(out.buffer, out.byteOffset, out.byteLength));
 }
 
 // -------- TwiML: start a Media Stream to /media --------
@@ -134,10 +131,16 @@ class Bridge {
     this.openaiOutputSampleRate = 16000;
     this.openaiReady = false;
     this.fallbackTriggered = false;
-    this.loggedReceivedAudio = false;
-    this.loggedSentAudio = false;
     this.closedByStop = false;
     this.warnedOpenAiNotReady = false;
+    this.bytesSinceCommit = 0;
+    this.commitThresholdBytes = 16000; // ~0.5s of 16kHz PCM16 audio
+    this.commitSilenceMs = 750;
+    this.commitTimer = null;
+    this.repromptedAfterMisunderstanding = false;
+    this.twilioChunkCount = 0;
+    this.openAiAudioChunkCount = 0;
+    this.lastResponseIdLogged = null;
 
     console.log(
       `${now()} Connected to Twilio stream ${this.streamSid} (callSid: ${this.callSid || "unknown"})`
@@ -190,7 +193,7 @@ class Bridge {
             threshold: 0.5,
             prefix_padding_ms: 250,
             silence_duration_ms: 500,
-            create_response: true
+            create_response: false
           },
           input_audio_transcription: { model: "whisper-1" },
           input_audio_format: "pcm16",
@@ -199,13 +202,9 @@ class Bridge {
       };
       this.openaiWs.send(JSON.stringify(sessionUpdate));
 
-      this.openaiWs.send(JSON.stringify({
-        type: "response.create",
-        response: {
-          modalities: ["audio"],
-          instructions: "Hi, this is Rachel with AC and Heating — how can I help you today?"
-        }
-      }));
+      this._requestOpenAIResponse(
+        "Hi, this is Rachel with AC and Heating — how can I help you today?"
+      );
     });
 
     this.openaiWs.on("ping", () => {
@@ -224,6 +223,23 @@ class Bridge {
         return;
       }
 
+      if (msg.type === "session.created" && msg.session?.output_audio_format?.sample_rate_hz) {
+        this.openaiOutputSampleRate = msg.session.output_audio_format.sample_rate_hz;
+        return;
+      }
+
+      if (msg.type === "conversation.item.input_audio_transcription.failed") {
+        const reason = msg.error?.message || "unknown transcription issue";
+        this._handleMisunderstanding(`Transcription failed: ${reason}`);
+        return;
+      }
+
+      if (msg.type === "response.error") {
+        const reason = msg.error?.message || "unknown response error";
+        this._handleMisunderstanding(`OpenAI response error: ${reason}`);
+        return;
+      }
+
       if (msg.type === "conversation.item.input_audio_transcription.completed" && msg.transcript) {
         this.summaryTexts.push(`[Caller] ${msg.transcript}`);
         return;
@@ -234,19 +250,24 @@ class Bridge {
       }
 
       if (msg.type === "response.audio.delta" && msg.delta) {
+        if (msg.response_id && msg.response_id !== this.lastResponseIdLogged) {
+          this.lastResponseIdLogged = msg.response_id;
+          this.openAiAudioChunkCount = 0;
+          console.log(`${now()} OpenAI started audio response ${msg.response_id} for stream ${this.streamSid}`);
+        }
         const int16 = pcm16B64ToInt16(msg.delta);
+        this.openAiAudioChunkCount += 1;
+        const pcmBytes = int16.length * 2;
+        console.log(`${now()} OpenAI audio chunk #${this.openAiAudioChunkCount} (${pcmBytes} bytes PCM16) for stream ${this.streamSid}`);
         const ulawB64 = pcm16ToUlawB64FromPCM16Int16(int16, this.openaiOutputSampleRate);
         this._twilioMedia(ulawB64);
         return;
       }
 
       if (msg.type === "response.audio.done" || msg.type === "response.done") {
+        console.log(`${now()} OpenAI finished audio response for stream ${this.streamSid}`);
         this._twilioMark();
         return;
-      }
-
-      if (msg.type === "session.created" && msg.session?.output_audio_format?.sample_rate_hz) {
-        this.openaiOutputSampleRate = msg.session.output_audio_format.sample_rate_hz;
       }
     });
 
@@ -271,10 +292,7 @@ class Bridge {
   _twilioMedia(base64Ulaw) {
     if (this.fallbackTriggered) return;
     if (this.twilioWs?.readyState === WebSocket.OPEN) {
-      if (!this.loggedSentAudio) {
-        console.log(`${now()} Sent audio back to Twilio for stream ${this.streamSid}`);
-        this.loggedSentAudio = true;
-      }
+      console.log(`${now()} Forwarding OpenAI audio chunk to Twilio for stream ${this.streamSid}`);
       this.twilioWs.send(JSON.stringify({
         event: "media",
         streamSid: this.streamSid,
@@ -292,11 +310,67 @@ class Bridge {
     }
   }
 
+  _clearCommitTimer() {
+    if (this.commitTimer) {
+      clearTimeout(this.commitTimer);
+      this.commitTimer = null;
+    }
+  }
+
+  _scheduleCommit() {
+    if (this.fallbackTriggered) return;
+    this._clearCommitTimer();
+    this.commitTimer = setTimeout(() => {
+      this.commitTimer = null;
+      this._commitAudioBuffer({ force: true });
+    }, this.commitSilenceMs);
+  }
+
+  _requestOpenAIResponse(instructions = "continue conversation naturally") {
+    if (this.fallbackTriggered) return;
+    if (!this.openaiWs || this.openaiWs.readyState !== WebSocket.OPEN) return;
+    console.log(
+      `${now()} Requesting OpenAI response for stream ${this.streamSid} (${instructions})`
+    );
+    this.openaiWs.send(
+      JSON.stringify({
+        type: "response.create",
+        response: { modalities: ["audio"], instructions }
+      })
+    );
+  }
+
+  _commitAudioBuffer({ force = false, requestResponse = true } = {}) {
+    if (this.fallbackTriggered) return;
+    if (!this.openaiWs || this.openaiWs.readyState !== WebSocket.OPEN) return;
+    const bytesToCommit = this.bytesSinceCommit;
+    if (bytesToCommit === 0 && !force) return;
+    if (bytesToCommit === 0) return;
+    this._clearCommitTimer();
+    console.log(`${now()} Committing ${bytesToCommit} bytes of caller audio to OpenAI for stream ${this.streamSid}`);
+    this.openaiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+    this.bytesSinceCommit = 0;
+    if (requestResponse) {
+      this._requestOpenAIResponse();
+    }
+  }
+
+  _handleMisunderstanding(reason) {
+    console.warn(`${now()} OpenAI could not understand caller audio for stream ${this.streamSid}: ${reason}`);
+    if (!this.repromptedAfterMisunderstanding) {
+      this.repromptedAfterMisunderstanding = true;
+      this._requestOpenAIResponse(
+        "I didn't quite catch that, but I'd love to help. Could you share that once more?"
+      );
+    }
+  }
+
   _sendFallbackAndClose(reason) {
     if (this.fallbackTriggered) return;
     this.fallbackTriggered = true;
     this.closedByStop = true;
     this.openaiReady = false;
+    this._clearCommitTimer();
     console.error(`${now()} Triggering fallback for stream ${this.streamSid}: ${reason}`);
 
     if (this.openaiWs && this.openaiWs.readyState === WebSocket.OPEN) {
@@ -348,21 +422,38 @@ class Bridge {
           }
           return;
         }
-        if (!this.loggedReceivedAudio) {
-          console.log(`${now()} Received audio from Twilio for stream ${this.streamSid}`);
-          this.loggedReceivedAudio = true;
-        }
-        const pcm16b64 = ulawB64ToPcm16B64_16k(obj.media.payload);
+        const ulawBuffer = b64ToBuffer(obj.media.payload);
+        this.twilioChunkCount += 1;
+        console.log(
+          `${now()} Twilio audio chunk #${this.twilioChunkCount} received for stream ${this.streamSid} (${ulawBuffer.length} bytes μ-law)`
+        );
+        const pcm16Buffer = ulawBufferToPcm16Buffer16k(ulawBuffer);
+        console.log(
+          `${now()} Converted chunk #${this.twilioChunkCount} to PCM16/16kHz (${pcm16Buffer.length} bytes) for stream ${this.streamSid}`
+        );
+        const pcm16b64 = bufferToB64(pcm16Buffer);
+        console.log(
+          `${now()} Sending PCM16 chunk #${this.twilioChunkCount} to OpenAI for stream ${this.streamSid}`
+        );
         this.openaiWs.send(JSON.stringify({
           type: "input_audio_buffer.append",
           audio: pcm16b64
         }));
-        // With server VAD we do NOT manually commit; model handles turns.
+        this.bytesSinceCommit += pcm16Buffer.length;
+        console.log(
+          `${now()} ${this.bytesSinceCommit} bytes of caller audio pending commit for stream ${this.streamSid}`
+        );
+        this._scheduleCommit();
+        if (this.bytesSinceCommit >= this.commitThresholdBytes) {
+          this._commitAudioBuffer();
+        }
         break;
       }
       case "stop":
         this.closedByStop = true;
         console.log(`${now()} Twilio stream ${this.streamSid} sent stop.`);
+        this._clearCommitTimer();
+        this._commitAudioBuffer({ force: true, requestResponse: false });
         if (this.openaiWs && this.openaiWs.readyState === WebSocket.OPEN) {
           try {
             this.openaiWs.close(1000, "twilio stop");
@@ -416,7 +507,11 @@ wss.on("connection", (ws) => {
       bridge.handleTwilioMessage(obj);
     }
   });
-  ws.on("close", () => { /* end */ });
+  ws.on("close", () => {
+    if (bridge) {
+      bridge._clearCommitTimer();
+    }
+  });
   ws.on("error", (e) => console.error(`${now()} Twilio WS error:`, e?.message || e));
 });
 
