@@ -172,34 +172,114 @@ SALIDA — SOLO JSON:
 
 // ============ OpenAI (structured) ============
 async function aiTurn(session, userLine){
+  const fallbackResponse = () => {
+    const isSpanish = session.lang === "es";
+    const steps = [
+      {
+        key: "zip",
+        next: "ask_zip",
+        say: isSpanish ? "¿Me comparte su código postal?" : "Could you share the ZIP you're in?"
+      },
+      {
+        key: "service",
+        next: "ask_service",
+        say: isSpanish ? "¿Qué tipo de servicio necesita?" : "What kind of service do you need?"
+      },
+      {
+        key: "name",
+        next: "ask_contact",
+        say: isSpanish ? "¿A nombre de quién registro la visita?" : "What name should I put on the ticket?"
+      },
+      {
+        key: "phone",
+        next: "ask_contact",
+        say: isSpanish ? "¿Cuál es el mejor número para contactarle?" : "What's the best number to reach you?"
+      }
+    ];
+
+    for (const step of steps) {
+      if (!session.lead[step.key]) {
+        return { say: step.say, next: step.next, updates: {} };
+      }
+    }
+
+    return {
+      say: isSpanish
+        ? "Perfecto, tengo todos los datos. ¿Está bien así?"
+        : "Great, I have everything I need. Does that look right?",
+      next: "confirm",
+      updates: {}
+    };
+  };
+
+  const responseSchema = {
+    name: "ai_turn_response",
+    schema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["say", "next", "updates"],
+      properties: {
+        say: { type: "string" },
+        next: {
+          type: "string",
+          enum: ["ask_issue", "ask_zip", "ask_service", "ask_contact", "confirm", "close", "answer_faq"]
+        },
+        updates: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            name: { type: "string" },
+            phone: { type: "string" },
+            zip: { type: "string" },
+            service: { type: "string" },
+            address: { type: "string" }
+          }
+        }
+      }
+    }
+  };
+
   const payload = {
     model: "gpt-4o-mini",
     temperature: 0.4,
+    response_format: { type: "json_schema", json_schema: responseSchema },
     messages: [
       { role: "system", content: systemPrompt(session) },
       ...session.transcript,
       { role: "user", content: userLine }
     ]
   };
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-    body: JSON.stringify(payload)
-  }).then(x=>x.json());
 
-  let say = "Okay—could you repeat that for me?";
-  let next = "ask_issue";
-  let updates = {};
-  try{
-    const raw = (r.choices?.[0]?.message?.content || "").trim();
-    const cleaned = raw.startsWith("{") ? raw : raw.slice(raw.indexOf("{"));
-    const jsonText = cleaned.slice(0, cleaned.lastIndexOf("}")+1);
-    const parsed = JSON.parse(jsonText);
-    if (parsed.say) say = parsed.say.trim();
-    if (parsed.next) next = parsed.next.trim();
-    if (parsed.updates && typeof parsed.updates === "object") updates = parsed.updates;
-  }catch{}
-  return { say, next, updates };
+  const fallback = fallbackResponse();
+
+  try {
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+      body: JSON.stringify(payload)
+    }).then(x => x.json());
+
+    if (r.error) throw new Error(r.error.message || "OpenAI error");
+
+    const choice = r.choices?.[0];
+    let raw = choice?.message?.content;
+    if (Array.isArray(raw)) raw = raw.map(part => part?.text || "").join("");
+    if (typeof raw !== "string") throw new Error("No content in completion");
+
+    const parsed = JSON.parse(raw);
+    const say = typeof parsed.say === "string" ? parsed.say.trim() : "";
+    const next = typeof parsed.next === "string" ? parsed.next.trim() : "";
+    const updates = parsed.updates && typeof parsed.updates === "object" ? parsed.updates : {};
+
+    return {
+      say: say || fallback.say,
+      next: next || fallback.next,
+      updates: { ...fallback.updates, ...updates }
+    };
+  } catch (err) {
+    console.error("aiTurn fallback", err);
+    return fallback;
+  }
 }
 
 // ============ ElevenLabs TTS ============
@@ -305,8 +385,16 @@ app.post("/gather", async (req, res) => {
     }
 
     const retry = session.lang === "es"
-      ? ["Perdón, ¿podría repetirlo?", "Disculpe, no lo escuché bien.", "¿Podría decirlo de nuevo, por favor?"]
-      : ["Sorry, could you repeat that for me?", "I didn’t catch that—could you say it again?", "One more time, please?"];
+      ? [
+          "No alcancé a escuchar esa parte—¿podría decirla otra vez?",
+          "Perdón, no estuvo claro. Una vez más, por favor.",
+          "Espere tantito—¿podría decir eso una vez más?"
+        ]
+      : [
+          "I didn’t catch that part—could you say it again?",
+          "Sorry, that wasn’t clear. One more time, please.",
+          "Hang on—could you say that once more?"
+        ];
     const line = retry[session.noSpeechCount % retry.length];
 
     const tw = new Twiml.VoiceResponse();
