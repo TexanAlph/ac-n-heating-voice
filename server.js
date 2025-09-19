@@ -67,6 +67,40 @@ function getSession(id){
   return s;
 }
 
+function followUpForNext(next, session) {
+  const isSpanish = session.lang === "es";
+  switch (next) {
+    case "ask_issue":
+      return isSpanish
+        ? "¿Podría contarme un poco más del problema?"
+        : "Could you tell me a bit more about the issue?";
+    case "ask_zip":
+      return isSpanish
+        ? "¿Me comparte su código postal?"
+        : "Can you tell me your ZIP code?";
+    case "ask_service":
+      return isSpanish
+        ? "¿Qué tipo de servicio necesita?"
+        : "What kind of service do you need?";
+    case "ask_contact":
+      if (!session.lead.name) {
+        return isSpanish
+          ? "¿A nombre de quién registro la visita?"
+          : "What name should I put on the ticket?";
+      }
+      if (!session.lead.phone) {
+        return isSpanish
+          ? "¿Cuál es el mejor número para contactarle?"
+          : "What's the best number to reach you?";
+      }
+      return isSpanish
+        ? "¿Podría compartir sus datos de contacto, por favor?"
+        : "Could you share your contact details, please?";
+    default:
+      return null;
+  }
+}
+
 const CALL_METRICS = new Map(); // simple spam control
 function recordCallStart(from){
   const m = CALL_METRICS.get(from) || { timestamps:[], shortHangs:0, flagged:false, deny:false };
@@ -425,7 +459,17 @@ app.post("/gather", async (req, res) => {
     if (typeof updates[k] === "string" && updates[k].trim()) session.lead[k] = updates[k].trim();
   }
 
-  let say = aiSay;
+  let say = typeof aiSay === "string" ? aiSay : "";
+  const lowerSay = say.toLowerCase();
+  if (lowerSay.includes("sorry to hear")) {
+    const followUp = followUpForNext(next, session);
+    if (followUp && !lowerSay.includes(followUp.toLowerCase())) {
+      let trimmed = say.trimEnd();
+      if (trimmed && !/[.?!¿¡…]$/.test(trimmed)) trimmed += ".";
+      if (trimmed) trimmed += " ";
+      say = trimmed + followUp;
+    }
+  }
   if (say === session.lastSay) say = (session.lang==="es"?"Entendido. ":"Got it. ") + say;
   session.lastSay = say;
   session.transcript.push({ role: "assistant", content: say });
