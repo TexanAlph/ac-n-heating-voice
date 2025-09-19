@@ -12,6 +12,14 @@ const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
+// ===== TEMP LOGGING (see SpeechResult in Render logs; remove later if you want) =====
+app.use((req, _res, next) => {
+  if (req.path === "/voice" || req.path === "/gather" || req.path === "/confirm") {
+    try { console.log(`[${req.path}]`, JSON.stringify(req.body || {}, null, 2)); } catch {}
+  }
+  next();
+});
+
 /* ========= Config & Embedded Site Knowledge ========= */
 const COMPANY_NAME = process.env.COMPANY_NAME || "AC and Heating";
 const COMPANY_CITY = process.env.COMPANY_CITY || "San Antonio";
@@ -54,7 +62,6 @@ function isAfterHours() {
     return h < 8 || h >= 18;
   }
 }
-
 function looksSpanish(t = "") {
   t = t.toLowerCase();
   return /¿|¡|usted|ustedes|necesito|aire|calefacci[oó]n|reparaci[oó]n|instalaci[oó]n|mañana|hoy|urgente|no enfr[ií]a|no calienta/.test(t);
@@ -295,9 +302,9 @@ app.get("/tts", async (req, res) => {
         text,
         model_id: "eleven_multilingual_v2",
         voice_settings: {
-          stability: 0.28,
-          similarity_boost: 0.98,
-          style: 0.9,
+          stability: 0.24,
+          similarity_boost: 0.99,
+          style: 0.95,
           use_speaker_boost: true
         }
       })
@@ -333,26 +340,26 @@ app.post("/voice", (req, res) => {
   const session = getSession(from);
   const twiml = new Twiml.VoiceResponse();
 
-  // Put TTS inside Gather so caller can barge-in naturally
+  // IMPORTANT: bargeIn belongs on the prompt INSIDE <Gather>
   const g = twiml.gather({
     input: "speech",
     action: "/gather",
     method: "POST",
-    bargeIn: true,
-    speechTimeout: "2",
+    speechTimeout: "auto",
     language: session.lang === "es" ? "es-US" : "en-US",
-    hints: "air conditioning repair, heating repair, installation, maintenance, thermostat, emergency, zip code"
+    speechModel: "phone_call",
+    profanityFilter: "false"
   });
 
   if (session.step === "greet") {
     const opener = `Hi, this is Rachel with ${COMPANY_NAME}… how can I help you today?`;
     const sayUrl = new URL("https://" + req.get("host") + "/tts");
     sayUrl.searchParams.set("text", opener);
-    g.play(sayUrl.toString());
+    g.play({ bargeIn: true }, sayUrl.toString());
     session.transcript.push({ role: "assistant", content: opener });
     session.step = "intake";
   } else {
-    g.say({ voice: "alice" }, " ");
+    g.say({ bargeIn: true, voice: "alice" }, " ");
   }
 
   res.type("text/xml").send(twiml.toString());
@@ -393,12 +400,15 @@ app.post("/gather", async (req, res) => {
     const sayUrl = new URL("https://" + req.get("host") + "/tts"); sayUrl.searchParams.set("text", line);
     tw.play(sayUrl.toString());
     const g = tw.gather({
-      input: "speech", action: "/gather", method: "POST",
-      bargeIn: true, speechTimeout: "2",
+      input: "speech",
+      action: "/gather",
+      method: "POST",
+      speechTimeout: "auto",
       language: session.lang === "es" ? "es-US" : "en-US",
-      hints: "air conditioning repair, heating repair, installation, maintenance, thermostat, emergency, zip code"
+      speechModel: "phone_call",
+      profanityFilter: "false"
     });
-    g.say({ voice: "alice" }, " ");
+    g.say({ bargeIn: true, voice: "alice" }, " ");
     return res.type("text/xml").send(tw.toString());
   }
 
@@ -436,7 +446,18 @@ app.post("/gather", async (req, res) => {
 
   const twiml = new Twiml.VoiceResponse();
   const sayUrl = new URL("https://" + req.get("host") + "/tts"); sayUrl.searchParams.set("text", say);
-  twiml.play(sayUrl.toString());
+
+  // IMPORTANT: play the bot reply INSIDE the Gather with bargeIn
+  const g = twiml.gather({
+    input: "speech",
+    action: "/gather",
+    method: "POST",
+    speechTimeout: "auto",
+    language: session.lang === "es" ? "es-US" : "en-US",
+    speechModel: "phone_call",
+    profanityFilter: "false"
+  });
+  g.play({ bargeIn: true }, sayUrl.toString());
 
   const ready = session.lead.name && session.lead.phone && session.lead.zip && session.lead.service;
 
@@ -445,22 +466,19 @@ app.post("/gather", async (req, res) => {
       ? `Tengo ${session.lead.name}, ${session.lead.phone}, código ${session.lead.zip}, ${session.lead.service}. ¿Correcto?`
       : `I have ${session.lead.name}, ${session.lead.phone}, ZIP ${session.lead.zip}, ${session.lead.service}. Is that correct?`;
     const cUrl = new URL("https://" + req.get("host") + "/tts"); cUrl.searchParams.set("text", confirmLine);
-    twiml.play(cUrl.toString());
 
-    const g = twiml.gather({
-      input: "speech", action: "/confirm", method: "POST",
-      bargeIn: true, speechTimeout: "2",
-      language: session.lang === "es" ? "es-US" : "en-US"
-    });
-    g.say({ voice: "alice" }, " ");
-  } else {
-    const g = twiml.gather({
-      input: "speech", action: "/gather", method: "POST",
-      bargeIn: true, speechTimeout: "2",
+    const tw2 = new Twiml.VoiceResponse();
+    const gg = tw2.gather({
+      input: "speech",
+      action: "/confirm",
+      method: "POST",
+      speechTimeout: "auto",
       language: session.lang === "es" ? "es-US" : "en-US",
-      hints: "air conditioning repair, heating repair, installation, maintenance, thermostat, emergency, zip code"
+      speechModel: "phone_call",
+      profanityFilter: "false"
     });
-    g.say({ voice: "alice" }, " ");
+    gg.play({ bargeIn: true }, cUrl.toString());
+    return res.type("text/xml").send(tw2.toString());
   }
 
   res.type("text/xml").send(twiml.toString());
@@ -479,13 +497,17 @@ app.post("/confirm", async (req, res) => {
       ? "Gracias por aclararlo — ¿qué debo corregir?"
       : "Thanks for clarifying — what should I correct?";
     const sUrl = new URL("https://" + req.get("host") + "/tts"); sUrl.searchParams.set("text", fix);
-    twiml.play(sUrl.toString());
+
     const g = twiml.gather({
-      input: "speech", action: "/gather", method: "POST",
-      bargeIn: true, speechTimeout: "2",
-      language: session.lang === "es" ? "es-US" : "en-US"
+      input: "speech",
+      action: "/gather",
+      method: "POST",
+      speechTimeout: "auto",
+      language: session.lang === "es" ? "es-US" : "en-US",
+      speechModel: "phone_call",
+      profanityFilter: "false"
     });
-    g.say({ voice: "alice" }, " ");
+    g.play({ bargeIn: true }, sUrl.toString());
     return res.type("text/xml").send(twiml.toString());
   }
 
@@ -516,9 +538,7 @@ app.post("/confirm", async (req, res) => {
       });
       console.log("Lead SMS sent:", summary);
     }
-  } catch (e) {
-    console.error("SMS error:", e);
-  }
+  } catch (e) { console.error("SMS error:", e); }
 
   const sUrl = new URL("https://" + req.get("host") + "/tts"); sUrl.searchParams.set("text", closing);
   twiml.play(sUrl.toString());
@@ -552,9 +572,7 @@ app.post("/vm-finish", async (req, res) => {
         body: `VM from ${from}: ${recordingUrl}`
       });
     }
-  } catch (e) {
-    console.error("VM SMS error:", e);
-  }
+  } catch (e) { console.error("VM SMS error:", e); }
   const tw = new Twiml.VoiceResponse();
   tw.say("Thanks. We’ll call you shortly. Goodbye.");
   tw.hangup();
