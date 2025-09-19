@@ -1,127 +1,116 @@
-// server.js
 import express from "express";
 import bodyParser from "body-parser";
-import pkg from "twilio";
+import { WebSocketServer } from "ws";
+import fetch from "node-fetch";
+import twilio from "twilio";
 
-const { twiml: Twiml, Twilio } = pkg;
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 
-// Twilio setup
-const TWILIO_SID = process.env.TWILIO_ACCOUNT_SID;
-const TWILIO_AUTH = process.env.TWILIO_AUTH_TOKEN;
-const FROM_SMS = process.env.TWILIO_NUMBER;
-const TO_SMS = "+12104781836"; // Your cell
-const twilioClient = new Twilio(TWILIO_SID, TWILIO_AUTH);
+// Twilio client for SMS summaries
+const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-// Session tracker
-const sessions = {};
-
-// State flow order
-const STATES = ["problem", "name", "phone", "address", "zip", "confirm", "close"];
-
-// Helper: get next state
-function getNextState(current) {
-  const idx = STATES.indexOf(current);
-  return idx >= 0 && idx < STATES.length - 1 ? STATES[idx + 1] : "close";
-}
-
-// Helper: get question for each state
-function getQuestion(state, data = {}) {
-  switch (state) {
-    case "problem":
-      return "Hi, this is Rachel with AC and Heating. How can I help you today?";
-    case "name":
-      return "Mhm, okay, I got you. Can I have your name please?";
-    case "phone":
-      return "Thanks. What’s the best number to reach you?";
-    case "address":
-      return "And what’s the service address?";
-    case "zip":
-      return "And the ZIP code there?";
-    case "confirm":
-      return `So I have ${data.name || "?"}, ${data.phone || "?"}, ${data.address || "?"}, ZIP ${data.zip || "?"}. Is that correct?`;
-    case "close":
-      return "Perfect, I’ve got everything noted. Dispatch will call you shortly. Goodbye.";
-    default:
-      return "Okay, thank you. Goodbye.";
-  }
-}
-
-// Twilio: entry point
-app.post("/voice", (req, res) => {
-  const callSid = req.body.CallSid;
-  sessions[callSid] = { state: "problem", data: {} };
-
-  const twiml = new Twiml.VoiceResponse();
-  const gather = twiml.gather({
-    input: "speech",
-    action: "/gather",
-    method: "POST",
-    speechTimeout: "auto"
-  });
-  gather.say(getQuestion("problem"), { voice: "alice" });
-
+// 1. Twilio webhook → returns TwiML to start media stream
+app.post("/twiml", (req, res) => {
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+      <Connect>
+        <Stream url="wss://${process.env.RENDER_EXTERNAL_HOSTNAME}/media" />
+      </Connect>
+    </Response>`;
   res.type("text/xml");
-  res.send(twiml.toString());
+  res.send(twiml);
 });
 
-// Handle responses
-app.post("/gather", (req, res) => {
-  const callSid = req.body.CallSid;
-  const speech = req.body.SpeechResult || "";
-  const session = sessions[callSid];
+// 2. WebSocket bridge for /media
+const wss = new WebSocketServer({ noServer: true });
+let activeCalls = {};
 
-  if (!session) {
-    const twiml = new Twiml.VoiceResponse();
-    twiml.say("Sorry, something went wrong. Goodbye.");
-    return res.type("text/xml").send(twiml.toString());
-  }
+app.server = app.listen(process.env.PORT || 10000, () => {
+  console.log("AI receptionist running on", process.env.PORT || 10000);
+});
 
-  // Save response by state
-  if (session.state !== "confirm" && session.state !== "close") {
-    session.data[session.state] = speech;
-  }
-
-  // Move state forward
-  session.state = getNextState(session.state);
-
-  // Build next question
-  const twiml = new Twiml.VoiceResponse();
-  if (session.state === "close") {
-    twiml.say(getQuestion("close"), { voice: "alice" });
-
-    // Send SMS summary
-    const summary = `
-New HVAC Call:
-Problem: ${session.data.problem || "?"}
-Name: ${session.data.name || "?"}
-Phone: ${session.data.phone || "?"}
-Address: ${session.data.address || "?"}
-ZIP: ${session.data.zip || "?"}
-    `;
-    twilioClient.messages.create({
-      body: summary,
-      from: FROM_SMS,
-      to: TO_SMS
-    }).catch(err => console.error("SMS failed:", err));
-
-  } else {
-    const gather = twiml.gather({
-      input: "speech",
-      action: "/gather",
-      method: "POST",
-      speechTimeout: "auto"
+// Upgrade HTTP → WS
+app.server.on("upgrade", (req, socket, head) => {
+  if (req.url === "/media") {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
     });
-    gather.say(getQuestion(session.state, session.data), { voice: "alice" });
   }
-
-  res.type("text/xml");
-  res.send(twiml.toString());
 });
 
-// Start server
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`AI receptionist running on ${PORT}`);
+// 3. Handle Twilio <-> OpenAI Realtime
+wss.on("connection", async (ws) => {
+  console.log("New Twilio media stream connected");
+
+  // Open Realtime session
+  const rt = await fetch("https://api.openai.com/v1/realtime/sessions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-realtime-preview-2024-12-17",
+      voice: "verse", // natural female voice
+      instructions: `
+You are Rachel, the AI receptionist for AC & Heating in San Antonio.
+Always sound warm, natural, and human — include fillers like “mhm,” “okay,” and pauses.
+
+Conversation flow:
+1. Greeting: “Hi, this is Rachel with AC and Heating, how can I help you today?”
+2. Capture problem type (repair, maintenance, or new install). If unclear, gently clarify.
+3. Ask follow-up: “Mhm, okay, got you — can you tell me a little more about that?”
+4. Once problem understood, ask for NAME first, then PHONE, then ADDRESS (including ZIP).
+   - Confirm each piece of info. If caller says no, politely re-ask.
+5. If caller asks something random, say: “I’ll jot that down and have the tech confirm.”
+6. Wrap up with natural variations: 
+   - “Perfect, thanks. I’ll pass this along to our tech right away.”
+   - “Got it, I’ll make sure our technician gets these details.”
+7. Never hang up abruptly — end warmly.
+
+If caller speaks unclearly, only ask once more: “Sorry, could you repeat that?” Do not loop endlessly.
+      `,
+    }),
+  });
+
+  const session = await rt.json();
+  const openaiUrl = session.client_secret.value;
+  const openaiWs = new WebSocket(openaiUrl);
+
+  // Track call info for SMS later
+  let callData = { name: null, phone: null, address: null, details: null };
+
+  // Twilio → OpenAI
+  ws.on("message", (msg) => {
+    if (openaiWs.readyState === WebSocket.OPEN) {
+      openaiWs.send(msg);
+    }
+  });
+
+  // OpenAI → Twilio
+  openaiWs.on("message", (msg) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(msg);
+    }
+  });
+
+  // When call ends → SMS summary
+  ws.on("close", async () => {
+    console.log("Call ended, sending summary SMS...");
+    let summary = `📞 New HVAC Lead\n\nIssue: ${callData.details || "Unknown"}\nName: ${callData.name || "Unknown"}\nPhone: ${callData.phone || "Unknown"}\nAddress: ${callData.address || "Unknown"}`;
+
+    try {
+      await twilioClient.messages.create({
+        body: summary,
+        from: process.env.TWILIO_PHONE_NUMBER,
+        to: "+12104781836", // your number
+      });
+      console.log("Summary sent to 210-478-1836");
+    } catch (err) {
+      console.error("SMS failed:", err);
+    }
+  });
 });
+
+export default app;
