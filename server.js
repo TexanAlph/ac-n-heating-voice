@@ -40,9 +40,11 @@ app.ws("/media", (twilioWs, req) => {
     }
   );
 
-  // When OpenAI connection is open, send greeting
+  // When OpenAI connection is open, send greeting + flush
   openaiWs.on("open", () => {
     console.log("✅ OpenAI Realtime connected");
+
+    // Step 1: Create response (the greeting)
     openaiWs.send(
       JSON.stringify({
         type: "response.create",
@@ -52,11 +54,19 @@ app.ws("/media", (twilioWs, req) => {
         }
       })
     );
+
+    // Step 2: Flush the audio so Twilio hears it
+    openaiWs.send(
+      JSON.stringify({
+        type: "response.output_audio"
+      })
+    );
   });
 
   // Handle OpenAI messages
   openaiWs.on("message", (msg) => {
     const event = JSON.parse(msg.toString());
+
     if (event.type === "output_audio_buffer.append") {
       // Relay audio back to Twilio
       twilioWs.send(
@@ -66,6 +76,7 @@ app.ws("/media", (twilioWs, req) => {
         })
       );
     }
+
     if (event.type === "output_audio_buffer.commit") {
       twilioWs.send(
         JSON.stringify({
@@ -74,6 +85,7 @@ app.ws("/media", (twilioWs, req) => {
         })
       );
     }
+
     if (event.type === "response.message") {
       console.log("💬 OpenAI text:", event.message?.content?.[0]?.text || "");
     }
