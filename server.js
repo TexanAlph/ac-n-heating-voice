@@ -1,9 +1,10 @@
 import express from "express";
 import expressWs from "express-ws";
 import bodyParser from "body-parser";
-import twilio from "twilio";
 import dotenv from "dotenv";
+import twilio from "twilio";
 import WebSocket from "ws";
+import * as base64 from "base64-js";
 
 dotenv.config();
 
@@ -13,46 +14,68 @@ app.use(bodyParser.urlencoded({ extended: false }));
 
 const { twiml: Twiml } = twilio;
 
-// Twilio webhook → returns TwiML to start streaming
+// Twilio webhook → tells Twilio to start streaming
 app.post("/twiml", (req, res) => {
   const response = new Twiml.VoiceResponse();
 
-  // Start a stream to our /media endpoint
-  response.start().stream({ url: `${process.env.RENDER_EXTERNAL_URL}/media` });
+  response.start().stream({
+    url: `${process.env.RENDER_EXTERNAL_URL}/media`
+  });
 
-  // Greeting (caller hears immediately)
   response.say("Hi, this is Rachel with AC and Heating. How can I help you today?");
-
-  // Prevent hangup
-  response.pause({ length: 600 });
+  response.pause({ length: 600 }); // keep call alive
 
   res.type("text/xml");
   res.send(response.toString());
 });
 
-// Media stream handler
-app.ws("/media", (ws, req) => {
-  console.log("🔗 New Twilio media stream connected");
+// Handle Twilio <Stream> WebSocket
+app.ws("/media", (ws) => {
+  console.log("🔗 Twilio media stream connected");
 
   // Connect to OpenAI Realtime
-  const openai = new WebSocket("wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17", {
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "OpenAI-Beta": "realtime=v1",
-    },
-  });
+  const openai = new WebSocket(
+    "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17",
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
+      },
+    }
+  );
 
-  // Forward Twilio audio → OpenAI
-  ws.on("message", (msg) => {
-    if (openai.readyState === WebSocket.OPEN) {
-      openai.send(msg);
+  // When Twilio sends audio
+  ws.on("message", (message) => {
+    const data = JSON.parse(message.toString());
+
+    if (data.event === "media" && openai.readyState === WebSocket.OPEN) {
+      // Decode base64 PCM from Twilio
+      const audioData = base64.toByteArray(data.media.payload);
+
+      // Send to OpenAI as input buffer
+      openai.send(JSON.stringify({
+        type: "input_audio_buffer.append",
+        audio: audioData.toString("base64")
+      }));
+
+      // Commit after each chunk
+      openai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+
+      // Create a new response
+      openai.send(JSON.stringify({ type: "response.create" }));
     }
   });
 
-  // Forward OpenAI audio → Twilio
-  openai.on("message", (msg) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(msg);
+  // When OpenAI sends audio back
+  openai.on("message", (event) => {
+    const response = JSON.parse(event.toString());
+
+    if (response.type === "output_audio_buffer.append" && response.audio) {
+      // Send audio back to Twilio
+      ws.send(JSON.stringify({
+        event: "media",
+        media: { payload: response.audio }
+      }));
     }
   });
 
@@ -62,7 +85,7 @@ app.ws("/media", (ws, req) => {
   });
 
   openai.on("close", () => {
-    console.log("❌ OpenAI connection closed");
+    console.log("❌ OpenAI closed");
     ws.close();
   });
 
@@ -71,5 +94,5 @@ app.ws("/media", (ws, req) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`AI receptionist running on ${PORT}`);
+  console.log(`AI receptionist running on port ${PORT}`);
 });
