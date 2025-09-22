@@ -1,9 +1,11 @@
 import express from "express";
 import bodyParser from "body-parser";
+import expressWs from "express-ws";
 import { WebSocket } from "ws";
 import twilio from "twilio";
 
 const app = express();
+expressWs(app);
 app.use(bodyParser.urlencoded({ extended: false }));
 
 // Twilio endpoint for incoming calls
