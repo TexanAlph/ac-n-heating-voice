@@ -1,12 +1,6 @@
-// Twilio Media Streams <-> OpenAI Realtime bridge
-// Hardened against the issues we saw:
-// - modalities ["audio","text"]
-// - PCMU (g711_ulaw, 8kHz) in/out
-// - wait for Twilio streamSid + OpenAI ready before greeting
-// - buffer early AI audio until streamSid exists
-// - handle BOTH "response.output_audio.delta" and "response.audio.delta"
-// - throttle input commits (some builds won't respond without commit)
-// - explicit output flush after response.create (harmless if not needed)
+// Twilio Media Streams <-> OpenAI Realtime bridge, with guaranteed clean audio back to Twilio.
+// Strategy: request PCM16@16k from OpenAI, resample to 8k and encode to G.711 µ-law, then send to Twilio.
+// Also gates greeting until Twilio streamSid exists, buffers early audio, throttles commits, and handles event name variants.
 
 import express from "express";
 import expressWs from "express-ws";
@@ -23,16 +17,66 @@ if (!OPENAI_API_KEY) {
 }
 
 const PORT  = process.env.PORT || 10000;
+const MODEL = "gpt-4o-realtime-preview-2024-12-17"; // swap if needed
+const VOICE = "alloy"; // alloy | verse | coral | copper etc.
 
-// Try model you have access to. If one fails, swap to the other.
-const MODEL = "gpt-4o-realtime-preview-2024-12-17"; // fallback: "gpt-4o-realtime-preview" or "gpt-4o-realtime"
-const VOICE = "alloy"; // try: alloy, verse, coral, copper
+// ---- PCM16 <-> µ-law helpers ----
+
+// µ-law encoder (G.711). Input: Int16 sample, Output: 8-bit µ-law byte
+function linearToMulaw(sample) {
+  const BIAS = 0x84;          // 132
+  const CLIP = 32635;
+  let sign = (sample >> 8) & 0x80;
+  if (sample < 0) sample = -sample;
+  if (sample > CLIP) sample = CLIP;
+  sample = sample + BIAS;
+  let exponent = 7;
+  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; expMask >>= 1) {
+    exponent--;
+  }
+  const mantissa = (sample >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0F;
+  const ulaw = ~(sign | (exponent << 4) | mantissa) & 0xFF;
+  return ulaw;
+}
+
+// Downsample PCM16 from srcRate to dstRate with simple linear interpolation (good enough for voice)
+function resamplePcm16(int16Arr, srcRate, dstRate) {
+  if (srcRate === dstRate) return int16Arr;
+  const ratio = srcRate / dstRate;
+  const newLen = Math.floor(int16Arr.length / ratio);
+  const out = new Int16Array(newLen);
+  let pos = 0;
+  for (let i = 0; i < newLen; i++) {
+    const idx = i * ratio;
+    const i0 = Math.floor(idx);
+    const i1 = Math.min(i0 + 1, int16Arr.length - 1);
+    const frac = idx - i0;
+    out[i] = (int16Arr[i0] * (1 - frac) + int16Arr[i1] * frac) | 0;
+    pos += ratio;
+  }
+  return out;
+}
+
+// PCM16 Int16Array -> µ-law Uint8Array
+function pcm16ToMulawBytes(pcm16) {
+  const out = new Uint8Array(pcm16.length);
+  for (let i = 0; i < pcm16.length; i++) out[i] = linearToMulaw(pcm16[i]);
+  return out;
+}
+
+// Base64 PCM16LE -> Int16Array
+function b64ToPcm16LE(b64) {
+  const buf = Buffer.from(b64, "base64");
+  // Ensure even length
+  const bytes = buf.byteLength & 1 ? buf.slice(0, buf.byteLength - 1) : buf;
+  return new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
+}
 
 const app = express();
 expressWs(app);
 app.use(bodyParser.urlencoded({ extended: false }));
 
-// 1) Twilio webhook -> TwiML that opens bi-di media to /media-stream
+// 1) Twilio webhook -> TwiML that opens a bidirectional media stream
 app.post("/incoming-call", (req, res) => {
   try {
     const host = req.headers["x-forwarded-host"] || req.headers.host;
@@ -62,9 +106,9 @@ app.ws("/media-stream", (twilioWs, req) => {
   let greeted = false;
 
   // buffer AI audio until streamSid exists
-  const pendingAudio = [];
+  const pendingMuLaw = [];
 
-  // throttle commits (commit at most every 200ms if we appended anything)
+  // throttle commits (commit at most every 200ms if anything appended)
   let appendedSinceCommit = false;
   let commitTimer = null;
   const startCommitTimer = () => {
@@ -72,21 +116,15 @@ app.ws("/media-stream", (twilioWs, req) => {
     commitTimer = setInterval(() => {
       if (appendedSinceCommit && openaiWs.readyState === WebSocket.OPEN) {
         openaiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-        // After committing, request a response (for builds that require it)
         openaiWs.send(JSON.stringify({ type: "response.create" }));
-        // And explicitly flush; harmless if the build streams automatically
         openaiWs.send(JSON.stringify({ type: "response.output_audio" }));
         appendedSinceCommit = false;
       }
     }, 200);
   };
+  const stopCommitTimer = () => { if (commitTimer) clearInterval(commitTimer); commitTimer = null; };
 
-  const stopCommitTimer = () => {
-    if (commitTimer) clearInterval(commitTimer);
-    commitTimer = null;
-  };
-
-  // Configure session (critical: modalities must be ["audio","text"])
+  // Configure session: modalities audio+text, input PCMU (8k), output PCM16 (16k) -> we will transcode to PCMU 8k
   const sendSessionUpdate = () => {
     const sessionUpdate = {
       type: "session.update",
@@ -94,7 +132,7 @@ app.ws("/media-stream", (twilioWs, req) => {
         modalities: ["audio", "text"],
         voice: VOICE,
         input_audio_format:  { type: "g711_ulaw", sample_rate: 8000 },
-        output_audio_format: { type: "g711_ulaw", sample_rate: 8000 },
+        output_audio_format: { type: "pcm16",    sample_rate: 16000 },
         turn_detection: { type: "server_vad", threshold: 0.5, silence_duration_ms: 600 },
         instructions: "You are a friendly phone assistant. Speak naturally; do not interrupt."
       }
@@ -112,15 +150,14 @@ app.ws("/media-stream", (twilioWs, req) => {
     };
     console.log("👋 response.create (greeting)");
     openaiWs.send(JSON.stringify(create));
-    // Explicit flush (ok in all builds, ignored if not needed)
     openaiWs.send(JSON.stringify({ type: "response.output_audio" }));
   };
 
-  const flushPendingAudio = () => {
+  const flushPending = () => {
     if (!streamSid || twilioWs.readyState !== WebSocket.OPEN) return;
-    while (pendingAudio.length) {
-      const delta = pendingAudio.shift();
-      twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: delta } }));
+    while (pendingMuLaw.length) {
+      const payload = pendingMuLaw.shift();
+      twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload } }));
     }
   };
 
@@ -129,7 +166,7 @@ app.ws("/media-stream", (twilioWs, req) => {
     console.log("✅ OpenAI Realtime connected");
     openaiReady = true;
     sendSessionUpdate();
-    // Wait for Twilio 'start' (streamSid) before greeting, to avoid dropping early audio.
+    // wait for Twilio stream 'start' before greeting
   });
 
   openaiWs.on("message", (raw) => {
@@ -140,17 +177,22 @@ app.ws("/media-stream", (twilioWs, req) => {
         console.error("❌ OpenAI error:", msg);
       }
 
-      // Handle both possible delta names we’ve seen in the wild
+      // Some builds use "response.output_audio.delta", others "response.audio.delta"
       const isDelta =
         (msg.type === "response.output_audio.delta" && msg.delta) ||
         (msg.type === "response.audio.delta" && msg.delta);
 
       if (isDelta) {
-        const delta = msg.delta; // base64 PCMU (g711_ulaw) per session settings
+        // msg.delta is base64 PCM16@16k per our session settings
+        const pcm16 = b64ToPcm16LE(msg.delta);
+        const pcm8k = resamplePcm16(pcm16, 16000, 8000);
+        const muLaw = pcm16ToMulawBytes(pcm8k);
+        const b64 = Buffer.from(muLaw).toString("base64");
+
         if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
-          twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: delta } }));
+          twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: b64 } }));
         } else {
-          pendingAudio.push(delta);
+          pendingMuLaw.push(b64);
         }
       }
 
@@ -173,10 +215,7 @@ app.ws("/media-stream", (twilioWs, req) => {
     stopCommitTimer();
     try { twilioWs.close(); } catch {}
   });
-
-  openaiWs.on("error", (err) => {
-    console.error("❌ OpenAI WS error:", err);
-  });
+  openaiWs.on("error", (err) => console.error("❌ OpenAI WS error:", err));
 
   // ----- Twilio events -----
   twilioWs.on("message", (raw) => {
@@ -187,13 +226,13 @@ app.ws("/media-stream", (twilioWs, req) => {
         case "start":
           streamSid = data.start.streamSid;
           console.log("▶️ Twilio stream started:", streamSid);
-          flushPendingAudio();
+          flushPending();
           if (openaiReady && !greeted) sendGreeting();
           startCommitTimer();
           break;
 
         case "media":
-          // forward caller audio (base64 PCMU) to OpenAI input buffer
+          // forward caller audio (base64 PCMU 8k) to OpenAI input buffer
           if (openaiWs.readyState === WebSocket.OPEN && data.media?.payload) {
             openaiWs.send(JSON.stringify({
               type: "input_audio_buffer.append",
@@ -223,7 +262,6 @@ app.ws("/media-stream", (twilioWs, req) => {
     stopCommitTimer();
     try { openaiWs.close(); } catch {}
   });
-
   twilioWs.on("error", (err) => {
     console.error("❌ Twilio WS error:", err);
     stopCommitTimer();
