@@ -56,7 +56,7 @@ app.ws("/media", (ws) => {
         instructions: "You are Rachel, a friendly HVAC receptionist. Greet callers warmly, ask about their HVAC issue, and respond conversationally with audio.",
         modalities: ["audio"],
         conversation: "default",
-        audio: { voice: "verse" }
+        audio: { voice: "verse", format: "wav" }
       }
     }));
   });
@@ -79,8 +79,10 @@ app.ws("/media", (ws) => {
 
   // Forward AI audio → caller
   openai.on("message", (event) => {
+    const eventString = event.toString();
+    console.log("OpenAI msg:", eventString.slice(0, 200));
     try {
-      const response = JSON.parse(event.toString());
+      const response = JSON.parse(eventString);
       if (response.type === "output_audio_buffer.append" && response.audio) {
         ws.send(JSON.stringify({
           event: "media",
