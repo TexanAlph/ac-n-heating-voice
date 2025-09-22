@@ -40,7 +40,7 @@ app.ws("/media", (twilioWs, req) => {
     }
   );
 
-  // When OpenAI connection is open, send greeting + flush
+  // When OpenAI connection is open, send greeting
   openaiWs.on("open", () => {
     console.log("✅ OpenAI Realtime connected");
 
@@ -68,7 +68,7 @@ app.ws("/media", (twilioWs, req) => {
     const event = JSON.parse(msg.toString());
 
     if (event.type === "output_audio_buffer.append") {
-      // Relay audio back to Twilio
+      console.log("🔊 Got audio chunk:", event.audio.length);
       twilioWs.send(
         JSON.stringify({
           event: "media",
@@ -78,6 +78,7 @@ app.ws("/media", (twilioWs, req) => {
     }
 
     if (event.type === "output_audio_buffer.commit") {
+      console.log("✅ Audio buffer committed");
       twilioWs.send(
         JSON.stringify({
           event: "mark",
@@ -86,21 +87,26 @@ app.ws("/media", (twilioWs, req) => {
       );
     }
 
+    if (event.type === "response.output_audio.done") {
+      console.log("🏁 Finished flushing audio");
+    }
+
     if (event.type === "response.message") {
-      console.log("💬 OpenAI text:", event.message?.content?.[0]?.text || "");
+      console.log("💬 Text:", event.message?.content?.[0]?.text || "");
     }
   });
 
-  // Handle Twilio -> OpenAI
+  // Relay Twilio -> OpenAI
   twilioWs.on("message", (msg) => {
     if (openaiWs.readyState === WebSocket.OPEN) {
       openaiWs.send(msg);
     }
   });
 
+  // Handle closures
   twilioWs.on("close", () => {
     console.log("❌ Twilio WebSocket closed");
-    openaiWs.close();
+    if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
   });
 
   openaiWs.on("close", () => {
