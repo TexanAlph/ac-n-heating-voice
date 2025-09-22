@@ -65,11 +65,18 @@ function resamplePCM16(int16Array, inRate, outRate) {
   }
   return out;
 }
+function int16ArrayToBufferLE(int16Array) {
+  const buf = Buffer.alloc(int16Array.length * 2);
+  for (let i = 0; i < int16Array.length; i++) {
+    buf.writeInt16LE(int16Array[i], i * 2);
+  }
+  return buf;
+}
 function ulawBufferToPcm16Buffer16k(ulawBuffer) {
   const pcm8k = new Int16Array(ulawBuffer.length);
   for (let i = 0; i < ulawBuffer.length; i++) pcm8k[i] = muLawDecode(ulawBuffer[i]);
   const pcm16k = resamplePCM16(pcm8k, 8000, 16000);
-  return Buffer.from(pcm16k.buffer, pcm16k.byteOffset, pcm16k.byteLength);
+  return int16ArrayToBufferLE(pcm16k);
 }
 function pcm16B64ToInt16(b64In) {
   const buf = b64ToBuffer(b64In);
@@ -242,6 +249,7 @@ class Bridge {
 
       if (msg.type === "conversation.item.input_audio_transcription.completed" && msg.transcript) {
         this.summaryTexts.push(`[Caller] ${msg.transcript}`);
+        this.repromptedAfterMisunderstanding = false;
         return;
       }
       if (msg.type === "response.text.delta" && msg.delta) {
@@ -344,8 +352,14 @@ class Bridge {
     if (this.fallbackTriggered) return;
     if (!this.openaiWs || this.openaiWs.readyState !== WebSocket.OPEN) return;
     const bytesToCommit = this.bytesSinceCommit;
-    if (bytesToCommit === 0 && !force) return;
-    if (bytesToCommit === 0) return;
+    if (bytesToCommit === 0) {
+      if (force) {
+        console.log(
+          `${now()} Commit requested for stream ${this.streamSid} but no caller audio buffered`
+        );
+      }
+      return;
+    }
     this._clearCommitTimer();
     console.log(`${now()} Committing ${bytesToCommit} bytes of caller audio to OpenAI for stream ${this.streamSid}`);
     this.openaiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
@@ -422,6 +436,10 @@ class Bridge {
           }
           return;
         }
+        if (!obj.media?.payload) {
+          console.warn(`${now()} Received Twilio media event without payload for stream ${this.streamSid}`);
+          return;
+        }
         const ulawBuffer = b64ToBuffer(obj.media.payload);
         this.twilioChunkCount += 1;
         console.log(
@@ -445,6 +463,9 @@ class Bridge {
         );
         this._scheduleCommit();
         if (this.bytesSinceCommit >= this.commitThresholdBytes) {
+          console.log(
+            `${now()} Caller audio reached commit threshold for stream ${this.streamSid}`
+          );
           this._commitAudioBuffer();
         }
         break;
