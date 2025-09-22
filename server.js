@@ -4,7 +4,6 @@ import bodyParser from "body-parser";
 import dotenv from "dotenv";
 import twilio from "twilio";
 import WebSocket from "ws";
-import * as base64 from "base64-js";
 
 dotenv.config();
 
@@ -50,7 +49,7 @@ app.ws("/media", (ws) => {
 
     if (data.event === "media" && openai.readyState === WebSocket.OPEN) {
       // Decode base64 PCM from Twilio
-      const audioData = base64.toByteArray(data.media.payload);
+      const audioData = Buffer.from(data.media.payload, "base64");
 
       // Send to OpenAI as input buffer
       openai.send(JSON.stringify({
