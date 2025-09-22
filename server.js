@@ -17,18 +17,22 @@ const { twiml: Twiml } = twilio;
 app.post("/twiml", (req, res) => {
   const response = new Twiml.VoiceResponse();
 
+  // Start sending audio to /media
   response.start().stream({
     url: `${process.env.RENDER_EXTERNAL_URL}/media`
   });
 
+  // Play greeting so caller hears something immediately
   response.say("Hi, this is Rachel with AC and Heating. How can I help you today?");
-  response.pause({ length: 600 }); // keep call alive
+
+  // Keep call alive
+  response.pause({ length: 600 });
 
   res.type("text/xml");
   res.send(response.toString());
 });
 
-// Handle Twilio <Stream> WebSocket
+// Twilio <Stream> WebSocket
 app.ws("/media", (ws) => {
   console.log("🔗 Twilio media stream connected");
 
@@ -43,38 +47,48 @@ app.ws("/media", (ws) => {
     }
   );
 
-  // When Twilio sends audio
+  // 🔑 Tell OpenAI to start talking right away
+  openai.on("open", () => {
+    console.log("✅ Connected to OpenAI Realtime");
+    openai.send(JSON.stringify({
+      type: "response.create",
+      response: {
+        instructions: "You are Rachel, a friendly HVAC receptionist. Greet callers warmly, ask about their HVAC issue, and respond conversationally with audio.",
+        modalities: ["audio"],
+        conversation: "default",
+        audio: { voice: "verse" }
+      }
+    }));
+  });
+
+  // Forward caller audio → OpenAI
   ws.on("message", (message) => {
     const data = JSON.parse(message.toString());
 
     if (data.event === "media" && openai.readyState === WebSocket.OPEN) {
-      // Decode base64 PCM from Twilio
       const audioData = Buffer.from(data.media.payload, "base64");
 
-      // Send to OpenAI as input buffer
       openai.send(JSON.stringify({
         type: "input_audio_buffer.append",
         audio: audioData.toString("base64")
       }));
 
-      // Commit after each chunk
       openai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-
-      // Create a new response
-      openai.send(JSON.stringify({ type: "response.create" }));
     }
   });
 
-  // When OpenAI sends audio back
+  // Forward AI audio → caller
   openai.on("message", (event) => {
-    const response = JSON.parse(event.toString());
-
-    if (response.type === "output_audio_buffer.append" && response.audio) {
-      // Send audio back to Twilio
-      ws.send(JSON.stringify({
-        event: "media",
-        media: { payload: response.audio }
-      }));
+    try {
+      const response = JSON.parse(event.toString());
+      if (response.type === "output_audio_buffer.append" && response.audio) {
+        ws.send(JSON.stringify({
+          event: "media",
+          media: { payload: response.audio }
+        }));
+      }
+    } catch (err) {
+      console.error("Error parsing OpenAI message:", err);
     }
   });
 
