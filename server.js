@@ -1,4 +1,3 @@
-// Minimal Twilio <-> OpenAI Realtime bridge
 import express from "express";
 import expressWs from "express-ws";
 import bodyParser from "body-parser";
@@ -10,7 +9,7 @@ dotenv.config();
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const MODEL  = "gpt-4o-realtime-preview-2024-12-17"; // realtime model
-const VOICE  = "verse"; // natural voice
+const VOICE  = "verse";
 const PORT   = process.env.PORT || 10000;
 
 const app = express();
@@ -30,18 +29,20 @@ app.post("/incoming-call", (req, res) => {
 app.ws("/media-stream", (twilioWs) => {
   console.log("📞 Twilio connected");
 
-  // OpenAI Realtime connection
   const openaiWs = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${MODEL}`,
     { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" } }
   );
 
   let streamSid = null;
+  let buffer = []; // store audio until OpenAI is ready
+  let openaiReady = false;
 
   openaiWs.on("open", () => {
     console.log("✅ OpenAI Realtime connected");
+    openaiReady = true;
 
-    // Configure session: bidirectional audio
+    // Configure session
     openaiWs.send(JSON.stringify({
       type: "session.update",
       session: {
@@ -55,6 +56,10 @@ app.ws("/media-stream", (twilioWs) => {
 
     // Trigger first response
     openaiWs.send(JSON.stringify({ type: "response.create" }));
+
+    // Flush buffered audio
+    buffer.forEach((msg) => openaiWs.send(msg));
+    buffer = [];
   });
 
   // Forward OpenAI → Twilio
@@ -74,19 +79,30 @@ app.ws("/media-stream", (twilioWs) => {
   twilioWs.on("message", (raw) => {
     let data;
     try { data = JSON.parse(raw.toString()); } catch { return; }
+
     if (data.event === "start") streamSid = data.start.streamSid;
+
     if (data.event === "media" && data.media?.payload) {
-      openaiWs.send(JSON.stringify({
+      const packet = JSON.stringify({
         type: "input_audio_buffer.append",
         audio: data.media.payload
-      }));
+      });
+      if (openaiReady) {
+        openaiWs.send(packet);
+      } else {
+        buffer.push(packet); // hold until ready
+      }
     }
+
     if (data.event === "stop") {
-      openaiWs.close();
-      twilioWs.close();
+      if (openaiWs.readyState === 1) openaiWs.close();
+      if (twilioWs.readyState === 1) twilioWs.close();
     }
   });
+
+  // Errors
+  openaiWs.on("error", (err) => console.error("❌ OpenAI error:", err));
+  twilioWs.on("error", (err) => console.error("❌ Twilio WS error:", err));
 });
 
-// Start server
 app.listen(PORT, () => console.log(`🚀 Basic AI receptionist running on ${PORT}`));
