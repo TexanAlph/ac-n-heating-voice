@@ -1,6 +1,8 @@
 import express from "express";
 import bodyParser from "body-parser";
 import twilio from "twilio";
+import { createServer } from "http";
+import { WebSocketServer } from "ws";
 import WebSocket from "ws";
 
 const { twiml: Twiml } = twilio;
@@ -23,17 +25,27 @@ let openaiWs = null;
 /**
  * Twilio Media Stream WebSocket handler
  */
+const server = createServer(app);
+
 app.ws = function (path, handler) {
-  const wss = new WebSocket.Server({ noServer: true });
-  app.on("upgrade", (req, socket, head) => {
-    if (req.url === path) {
+  const wss = new WebSocketServer({ noServer: true });
+  server.on("upgrade", (req, socket, head) => {
+    const { url } = req;
+    if (!url) {
+      socket.destroy();
+      return;
+    }
+
+    const pathname = new URL(url, `http://${req.headers.host}`).pathname;
+
+    if (pathname === path) {
       wss.handleUpgrade(req, socket, head, (ws) => handler(ws, req));
     }
   });
 };
 
 app.ws("/media", (twilioWs) => {
-  console.log("New Twilio media stream connected");
+  console.log("Twilio connected");
 
   // Connect to OpenAI Realtime
   openaiWs = new WebSocket(
@@ -47,7 +59,7 @@ app.ws("/media", (twilioWs) => {
   );
 
   openaiWs.on("open", () => {
-    console.log("Connected to OpenAI Realtime");
+    console.log("OpenAI connected");
 
     // Kick off conversation
     openaiWs.send(
@@ -73,6 +85,7 @@ app.ws("/media", (twilioWs) => {
           audio: audioB64,
         })
       );
+      console.log("Audio forwarded to OpenAI");
     } else if (data.event === "stop") {
       openaiWs?.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
     }
@@ -89,6 +102,7 @@ app.ws("/media", (twilioWs) => {
           media: { payload: audioB64 },
         })
       );
+      console.log("Audio received from OpenAI");
     }
   });
 
@@ -113,4 +127,4 @@ app.ws("/media", (twilioWs) => {
 });
 
 const port = process.env.PORT || 10000;
-app.listen(port, () => console.log(`AI receptionist running on ${port}`));
+server.listen(port, () => console.log(`AI receptionist running on ${port}`));
