@@ -15,9 +15,17 @@ app.use(bodyParser.json());
  * It tells Twilio to open a Media Stream to our /media endpoint.
  */
 app.post("/twiml", (req, res) => {
+  console.log("Twilio requested /twiml");
   const response = new Twiml.VoiceResponse();
-  response.start().stream({ url: `${process.env.RENDER_EXTERNAL_URL}/media` });
-  res.type("text/xml").send(response.toString());
+  const start = response.start();
+  start.stream({ url: `wss://${process.env.RENDER_EXTERNAL_HOSTNAME}/media` });
+  res.type("text/xml");
+  res.send(response.toString());
+});
+
+app.get("/health", (req, res) => {
+  res.type("text/plain");
+  res.send("OK");
 });
 
 let openaiWs = null;
