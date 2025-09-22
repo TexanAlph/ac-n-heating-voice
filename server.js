@@ -1,7 +1,12 @@
-// Twilio Media Streams <-> OpenAI Realtime (PCMU 8k) bridge
-// Fixes: wait for Twilio streamSid *and* OpenAI ready before greeting.
-// Buffers early AI audio until streamSid exists, then flushes.
-// Modalities fixed to ["audio","text"]; PCMU both ways; server VAD turn-taking.
+// Twilio Media Streams <-> OpenAI Realtime bridge
+// Hardened against the issues we saw:
+// - modalities ["audio","text"]
+// - PCMU (g711_ulaw, 8kHz) in/out
+// - wait for Twilio streamSid + OpenAI ready before greeting
+// - buffer early AI audio until streamSid exists
+// - handle BOTH "response.output_audio.delta" and "response.audio.delta"
+// - throttle input commits (some builds won't respond without commit)
+// - explicit output flush after response.create (harmless if not needed)
 
 import express from "express";
 import expressWs from "express-ws";
@@ -17,15 +22,17 @@ if (!OPENAI_API_KEY) {
   process.exit(1);
 }
 
-const PORT   = process.env.PORT  || 10000;
-const MODEL  = "gpt-4o-realtime-preview-2024-12-17";
-const VOICE  = "alloy"; // try: alloy, verse, coral, copper
+const PORT  = process.env.PORT || 10000;
+
+// Try model you have access to. If one fails, swap to the other.
+const MODEL = "gpt-4o-realtime-preview-2024-12-17"; // fallback: "gpt-4o-realtime-preview" or "gpt-4o-realtime"
+const VOICE = "alloy"; // try: alloy, verse, coral, copper
 
 const app = express();
 expressWs(app);
 app.use(bodyParser.urlencoded({ extended: false }));
 
-// 1) Twilio webhook -> TwiML that opens a bidirectional media stream
+// 1) Twilio webhook -> TwiML that opens bi-di media to /media-stream
 app.post("/incoming-call", (req, res) => {
   try {
     const host = req.headers["x-forwarded-host"] || req.headers.host;
@@ -40,11 +47,11 @@ app.post("/incoming-call", (req, res) => {
   }
 });
 
-// 2) Twilio <Stream> connects here (bi-di audio)
+// 2) Twilio <Stream> connects here
 app.ws("/media-stream", (twilioWs, req) => {
   console.log("📞 Twilio connected: /media-stream");
 
-  // Connect to OpenAI Realtime
+  // OpenAI Realtime WS
   const openaiWs = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${MODEL}`,
     { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" } }
@@ -54,15 +61,37 @@ app.ws("/media-stream", (twilioWs, req) => {
   let openaiReady = false;
   let greeted = false;
 
-  // Queue any early AI audio until streamSid exists
-  const pendingAudio = []; // array of base64 PCMU deltas
+  // buffer AI audio until streamSid exists
+  const pendingAudio = [];
 
-  // Update session: correct modalities + PCMU in/out + server VAD
+  // throttle commits (commit at most every 200ms if we appended anything)
+  let appendedSinceCommit = false;
+  let commitTimer = null;
+  const startCommitTimer = () => {
+    if (commitTimer) return;
+    commitTimer = setInterval(() => {
+      if (appendedSinceCommit && openaiWs.readyState === WebSocket.OPEN) {
+        openaiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+        // After committing, request a response (for builds that require it)
+        openaiWs.send(JSON.stringify({ type: "response.create" }));
+        // And explicitly flush; harmless if the build streams automatically
+        openaiWs.send(JSON.stringify({ type: "response.output_audio" }));
+        appendedSinceCommit = false;
+      }
+    }, 200);
+  };
+
+  const stopCommitTimer = () => {
+    if (commitTimer) clearInterval(commitTimer);
+    commitTimer = null;
+  };
+
+  // Configure session (critical: modalities must be ["audio","text"])
   const sendSessionUpdate = () => {
     const sessionUpdate = {
       type: "session.update",
       session: {
-        modalities: ["audio", "text"],             // <- critical: not ["audio"] alone
+        modalities: ["audio", "text"],
         voice: VOICE,
         input_audio_format:  { type: "g711_ulaw", sample_rate: 8000 },
         output_audio_format: { type: "g711_ulaw", sample_rate: 8000 },
@@ -83,8 +112,7 @@ app.ws("/media-stream", (twilioWs, req) => {
     };
     console.log("👋 response.create (greeting)");
     openaiWs.send(JSON.stringify(create));
-
-    // Some API versions require explicit flush; harmless if not needed:
+    // Explicit flush (ok in all builds, ignored if not needed)
     openaiWs.send(JSON.stringify({ type: "response.output_audio" }));
   };
 
@@ -101,7 +129,7 @@ app.ws("/media-stream", (twilioWs, req) => {
     console.log("✅ OpenAI Realtime connected");
     openaiReady = true;
     sendSessionUpdate();
-    // Do NOT greet yet; wait for Twilio 'start' so streamSid exists.
+    // Wait for Twilio 'start' (streamSid) before greeting, to avoid dropping early audio.
   });
 
   openaiWs.on("message", (raw) => {
@@ -112,13 +140,17 @@ app.ws("/media-stream", (twilioWs, req) => {
         console.error("❌ OpenAI error:", msg);
       }
 
-      // Stream AI audio back to Twilio as base64 PCMU
-      if (msg.type === "response.output_audio.delta" && msg.delta) {
+      // Handle both possible delta names we’ve seen in the wild
+      const isDelta =
+        (msg.type === "response.output_audio.delta" && msg.delta) ||
+        (msg.type === "response.audio.delta" && msg.delta);
+
+      if (isDelta) {
+        const delta = msg.delta; // base64 PCMU (g711_ulaw) per session settings
         if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
-          twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: msg.delta } }));
+          twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: delta } }));
         } else {
-          // buffer until we have streamSid
-          pendingAudio.push(msg.delta);
+          pendingAudio.push(delta);
         }
       }
 
@@ -138,6 +170,7 @@ app.ws("/media-stream", (twilioWs, req) => {
 
   openaiWs.on("close", () => {
     console.log("❌ OpenAI WebSocket closed");
+    stopCommitTimer();
     try { twilioWs.close(); } catch {}
   });
 
@@ -149,30 +182,30 @@ app.ws("/media-stream", (twilioWs, req) => {
   twilioWs.on("message", (raw) => {
     try {
       const data = JSON.parse(raw.toString());
-      // console.log("→ Twilio event:", data.event);
 
       switch (data.event) {
         case "start":
           streamSid = data.start.streamSid;
           console.log("▶️ Twilio stream started:", streamSid);
           flushPendingAudio();
-          // Greet only when BOTH sides are ready
           if (openaiReady && !greeted) sendGreeting();
+          startCommitTimer();
           break;
 
         case "media":
-          // Forward caller audio (base64 PCMU) to OpenAI input buffer
+          // forward caller audio (base64 PCMU) to OpenAI input buffer
           if (openaiWs.readyState === WebSocket.OPEN && data.media?.payload) {
             openaiWs.send(JSON.stringify({
               type: "input_audio_buffer.append",
               audio: data.media.payload
             }));
-            // With server VAD, the model will decide when to speak (no manual commit needed).
+            appendedSinceCommit = true;
           }
           break;
 
         case "stop":
           console.log("⏹️ Twilio stream stopped");
+          stopCommitTimer();
           try { openaiWs.close(); } catch {}
           try { twilioWs.close(); } catch {}
           break;
@@ -187,11 +220,13 @@ app.ws("/media-stream", (twilioWs, req) => {
 
   twilioWs.on("close", () => {
     console.log("❌ Twilio WebSocket closed");
+    stopCommitTimer();
     try { openaiWs.close(); } catch {}
   });
 
   twilioWs.on("error", (err) => {
     console.error("❌ Twilio WS error:", err);
+    stopCommitTimer();
     try { openaiWs.close(); } catch {}
   });
 });
